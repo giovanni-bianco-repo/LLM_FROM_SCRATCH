@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-
+# Ignore any folder that has 'data' in its name
+*data/
 # Virtual environments
 .venv

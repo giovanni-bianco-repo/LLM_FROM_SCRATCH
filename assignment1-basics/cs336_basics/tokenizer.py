@@ -141,8 +141,10 @@ def train_bpe(
 
 if __name__ == "__main__":
     # tiny smoke test: trains a few merges on this file itself
-    this_path: str = __file__
+    path: str = "/Users/giovannibianco/Documents/LLM_from_scratch/assignment1-basics/data/data/TinyStoriesV2-GPT4-valid.txt"
+    
     vocab_out, merges_out = train_bpe(
-        this_path, vocab_size=300, special_tokens=["<pad>", "<eos>"]
+        path, vocab_size=300, special_tokens=["<pad>", "<eos>"]
     )
     print(f"vocab size: {len(vocab_out)}; merges learned: {len(merges_out)}")
+    print(vocab_out)
