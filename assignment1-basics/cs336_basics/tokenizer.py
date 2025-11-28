@@ -22,38 +22,34 @@ def merge_ids(ids: List[int], pair: Tuple[int, int], idx: int) -> List[int]:
             i += 1
     return new_ids
 
-def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str]) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
-    #  Read Input
-    with open(input_path, 'r', encoding='utf-8') as f:
-        text = f.read()
-
-    # Setup Vocab (0-255)
-    vocab = {i: bytes([i]) for i in range(256)}
-    
-    #  Handle Special Tokens
+def _split_text_with_special_tokens(text: str, special_tokens: List[str]) -> List[str]:
+    """Split text into chunks, separating out special tokens."""
     if special_tokens:
-        # Sort by length descending to ensure longest match wins (e.g. <|endoftext|><|endoftext|>)
-        special_tokens.sort(key=len, reverse=True)
-        pattern = "(" + "|".join(re.escape(t) for t in special_tokens) + ")"
-        text_chunks = re.split(pattern, text)
-    else:
-        text_chunks = [text]
+        # Sort by length descending to ensure longest match wins
+        special_tokens_sorted = sorted(special_tokens, key=len, reverse=True)
+        pattern = "(" + "|".join(re.escape(t) for t in special_tokens_sorted) + ")"
+        return re.split(pattern, text)
+    return [text]
 
-    # Pre-tokenize
+def _pretokenize_text(text_chunks: List[str], special_tokens: List[str]) -> List[List[int]]:
+    """Pre-tokenize text chunks into lists of byte IDs, skipping special tokens."""
     words: List[List[int]] = []
     compiled_pat = re.compile(GPT2_SPLIT_PATTERN)
-
+    
     for chunk in text_chunks:
         if chunk in special_tokens:
             continue
         found = compiled_pat.findall(chunk)
         for token_str in found:
             words.append(list(token_str.encode("utf-8")))
+    
+    return words
 
-    # Build Initial Stats & Index
+def _build_initial_stats(words: List[List[int]]) -> Tuple[Dict[Tuple[int, int], int], Dict[Tuple[int, int], Dict[int, int]]]:
+    """Build initial pair statistics and indices from pre-tokenized words."""
     stats = {}
     indices = {}
-
+    
     for i, word in enumerate(words):
         for j in range(len(word) - 1):
             pair = (word[j], word[j+1])
@@ -61,103 +57,150 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str]) -> Tu
             if pair not in indices:
                 indices[pair] = {}
             indices[pair][i] = indices[pair].get(i, 0) + 1
+    
+    return stats, indices
 
-    #  Iterative Merging
+def _update_left_neighbor(new_word: List[int], word: List[int], i: int, pair: Tuple[int, int], 
+                          word_idx: int, stats: Dict, indices: Dict) -> None:
+    """Update stats when breaking the left neighbor pair during a merge."""
+    if len(new_word) > 0:
+        prev_token = new_word[-1]
+        old_pair_left = (prev_token, word[i])
+        
+        if old_pair_left in stats:
+            stats[old_pair_left] -= 1
+            if stats[old_pair_left] == 0:
+                del stats[old_pair_left]
+            
+            if old_pair_left in indices and word_idx in indices[old_pair_left]:
+                indices[old_pair_left][word_idx] -= 1
+                if indices[old_pair_left][word_idx] == 0:
+                    del indices[old_pair_left][word_idx]
+
+def _update_right_neighbor(word: List[int], i: int, pair: Tuple[int, int], 
+                           word_idx: int, stats: Dict, indices: Dict) -> None:
+    """Update stats when breaking the right neighbor pair during a merge."""
+    if i + 2 < len(word):
+        next_token = word[i+2]
+        old_pair_right = (word[i+1], next_token)
+        
+        # Only decrement if it's not the pair we are currently mass-deleting
+        if old_pair_right != pair:
+            if old_pair_right in stats:
+                stats[old_pair_right] -= 1
+                if stats[old_pair_right] == 0:
+                    del stats[old_pair_right]
+                
+                if old_pair_right in indices and word_idx in indices[old_pair_right]:
+                    indices[old_pair_right][word_idx] -= 1
+                    if indices[old_pair_right][word_idx] == 0:
+                        del indices[old_pair_right][word_idx]
+
+def _add_new_neighbors(new_word: List[int], word: List[int], i: int, idx: int, 
+                       word_idx: int, stats: Dict, indices: Dict) -> None:
+    """Add new pair statistics after performing a merge."""
+    # New Left Pair: (new_word[-2], idx)
+    if len(new_word) > 1:
+        prev = new_word[-2]
+        new_pair_left = (prev, idx)
+        stats[new_pair_left] = stats.get(new_pair_left, 0) + 1
+        if new_pair_left not in indices:
+            indices[new_pair_left] = {}
+        indices[new_pair_left][word_idx] = indices[new_pair_left].get(word_idx, 0) + 1
+    
+    # New Right Pair: (idx, word[i+2])
+    if i + 2 < len(word):
+        next_token = word[i+2]
+        new_pair_right = (idx, next_token)
+        stats[new_pair_right] = stats.get(new_pair_right, 0) + 1
+        if new_pair_right not in indices:
+            indices[new_pair_right] = {}
+        indices[new_pair_right][word_idx] = indices[new_pair_right].get(word_idx, 0) + 1
+
+def _merge_pair_in_word(word: List[int], pair: Tuple[int, int], idx: int, 
+                        word_idx: int, stats: Dict, indices: Dict) -> List[int]:
+    """Merge all occurrences of a pair in a single word, updating statistics."""
+    i = 0
+    new_word = []
+    
+    while i < len(word):
+        if i < len(word) - 1 and word[i] == pair[0] and word[i+1] == pair[1]:
+            # Match Found - update neighbors
+            _update_left_neighbor(new_word, word, i, pair, word_idx, stats, indices)
+            _update_right_neighbor(word, i, pair, word_idx, stats, indices)
+            
+            # Perform Merge
+            new_word.append(idx)
+            
+            # Add New Neighbors
+            _add_new_neighbors(new_word, word, i, idx, word_idx, stats, indices)
+            
+            i += 2
+        else:
+            # No Match
+            new_word.append(word[i])
+            i += 1
+    
+    return new_word
+
+def _perform_merges(words: List[List[int]], vocab: Dict[int, bytes], stats: Dict, 
+                    indices: Dict, num_merges: int) -> List[Tuple[bytes, bytes]]:
+    """Perform BPE merges iteratively, returning the list of merges."""
     merges = []
-    num_merges = vocab_size - 256 - len(special_tokens)
-
+    
     for _ in range(num_merges):
         if not stats:
             break
-
+        
         # Tie-breaker: Max count, then Lexicographically greater PAIR of bytes
-        # Logic: compare (stats[p], vocab[p[0]], vocab[p[1]]) 
         pair = max(stats, key=lambda p: (stats[p], vocab[p[0]], vocab[p[1]]))
         
         # Create new token
         idx = 256 + len(merges)
         vocab[idx] = vocab[pair[0]] + vocab[pair[1]]
         merges.append((vocab[pair[0]], vocab[pair[1]]))
-
+        
         # Merge in words
         word_indices_to_update = indices.get(pair, {})
         del stats[pair]
         del indices[pair]
+        
+        for word_idx in word_indices_to_update:
+            words[word_idx] = _merge_pair_in_word(words[word_idx], pair, idx, word_idx, stats, indices)
+    
+    return merges
 
-        for word_idx, count_in_word in word_indices_to_update.items():
-            word = words[word_idx]
-            i = 0
-            new_word = []
-            
-            while i < len(word):
-                if i < len(word) - 1 and word[i] == pair[0] and word[i+1] == pair[1]:
-                    # --- Match Found ---
-                    
-                    #  Handle Left Neighbor (Break Pair)
-                    # We check new_word[-1] to see if there is a token to the left in the sequence we are building.
-                    # This covers both original tokens and tokens we just merged in previous steps of this loop.
-                    if len(new_word) > 0:
-                        prev_token = new_word[-1]
-                        old_pair_left = (prev_token, word[i])
-                        
-                        if old_pair_left in stats:
-                            stats[old_pair_left] -= 1
-                            if stats[old_pair_left] == 0: del stats[old_pair_left]
-                            
-                            if old_pair_left in indices and word_idx in indices[old_pair_left]:
-                                indices[old_pair_left][word_idx] -= 1
-                                if indices[old_pair_left][word_idx] == 0: del indices[old_pair_left][word_idx]
-
-                    #  Handle Right Neighbor (Break Pair)
-                    if i + 2 < len(word):
-                        next_token = word[i+2]
-                        old_pair_right = (word[i+1], next_token)
-                        
-                        # Only decrement if it's not the pair we are currently mass-deleting
-                        if old_pair_right != pair:
-                            if old_pair_right in stats:
-                                stats[old_pair_right] -= 1
-                                if stats[old_pair_right] == 0: del stats[old_pair_right]
-                                
-                                if old_pair_right in indices and word_idx in indices[old_pair_right]:
-                                    indices[old_pair_right][word_idx] -= 1
-                                    if indices[old_pair_right][word_idx] == 0: del indices[old_pair_right][word_idx]
-
-                    #  Perform Merge (Add Token)
-                    new_word.append(idx)
-                    
-                    #  Add New Neighbors (Create Pair)
-                    # New Left Pair: (new_word[-2], idx)
-                    if len(new_word) > 1:
-                        prev = new_word[-2]
-                        new_pair_left = (prev, idx)
-                        stats[new_pair_left] = stats.get(new_pair_left, 0) + 1
-                        if new_pair_left not in indices: indices[new_pair_left] = {}
-                        indices[new_pair_left][word_idx] = indices[new_pair_left].get(word_idx, 0) + 1
-
-                    # New Right Pair: (idx, word[i+2])
-                    if i + 2 < len(word):
-                        next_token = word[i+2]
-                        new_pair_right = (idx, next_token)
-                        stats[new_pair_right] = stats.get(new_pair_right, 0) + 1
-                        if new_pair_right not in indices: indices[new_pair_right] = {}
-                        indices[new_pair_right][word_idx] = indices[new_pair_right].get(word_idx, 0) + 1
-                    
-                    i += 2
-                    
-                else:
-                    # No Match
-                    new_word.append(word[i])
-                    i += 1
-            
-            words[word_idx] = new_word
-
-    #  Add Special Tokens
+def _add_special_tokens_to_vocab(vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], 
+                                  special_tokens: List[str]) -> None:
+    """Add special tokens to the vocabulary."""
     current_id = 256 + len(merges)
     for st in special_tokens:
         vocab[current_id] = st.encode("utf-8")
         current_id += 1
 
+def train_bpe(input_path: str, vocab_size: int, special_tokens: List[str]) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """Train a BPE tokenizer on the input text file."""
+    # Read Input
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    
+    # Setup Vocab (0-255)
+    vocab = {i: bytes([i]) for i in range(256)}
+    
+    # Handle Special Tokens and Pre-tokenize
+    text_chunks = _split_text_with_special_tokens(text, special_tokens)
+    words = _pretokenize_text(text_chunks, special_tokens)
+    
+    # Build Initial Stats & Index
+    stats, indices = _build_initial_stats(words)
+    
+    # Perform Iterative Merging
+    num_merges = vocab_size - 256 - len(special_tokens)
+    merges = _perform_merges(words, vocab, stats, indices, num_merges)
+    
+    # Add Special Tokens
+    _add_special_tokens_to_vocab(vocab, merges, special_tokens)
+    
     return vocab, merges
 
 class Tokenizer:
