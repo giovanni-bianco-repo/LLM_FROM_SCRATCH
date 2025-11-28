@@ -1,4 +1,5 @@
 import regex as re
+import json
 from typing import List, Dict, Tuple, Iterable, Iterator
 
 # Standard GPT-2 pre-tokenization regex
@@ -217,6 +218,51 @@ class Tokenizer:
             if combined in self.vocab_inverse:
                 new_id = self.vocab_inverse[combined]
                 self.merge_map[(b1, b2)] = (rank, new_id)
+    
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: List[str] = None):
+        """Load tokenizer from serialized vocabulary and merges files.
+        
+        Args:
+            vocab_filepath: Path to JSON file containing vocabulary
+            merges_filepath: Path to text file containing merges
+            special_tokens: Optional list of special tokens
+            
+        Returns:
+            Tokenizer instance
+        """
+        # Load vocabulary from JSON
+        with open(vocab_filepath, 'r', encoding='utf-8') as f:
+            vocab_json = json.load(f)
+        
+        # Convert string keys to int and string values to bytes
+        vocab = {}
+        for key, value in vocab_json.items():
+            token_id = int(key)
+            # Handle both string and list representations of bytes
+            if isinstance(value, str):
+                token_bytes = value.encode('latin-1')  # latin-1 preserves byte values
+            elif isinstance(value, list):
+                token_bytes = bytes(value)
+            else:
+                token_bytes = value.encode('utf-8')
+            vocab[token_id] = token_bytes
+        
+        # Load merges from text file
+        merges = []
+        with open(merges_filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Parse merge format: "token1 token2"
+                parts = line.split(' ', 1)
+                if len(parts) == 2:
+                    token1 = parts[0].encode('latin-1')
+                    token2 = parts[1].encode('latin-1')
+                    merges.append((token1, token2))
+        
+        return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> List[int]:
         if self.special_tokens:
